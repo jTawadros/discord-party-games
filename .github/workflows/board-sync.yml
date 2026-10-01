@@ -1,0 +1,118 @@
+# Board sync: keeps the project board in step with status labels.
+#
+# When an issue gets a label like `status:ready`, this workflow moves its card
+# on the project board to the matching column (Ready), then removes any other
+# `status:*` labels so each issue only ever has one.
+#
+# Label             -> Board column
+# status:backlog    -> Backlog
+# status:ready      -> Ready
+# status:in-progress-> In Progress
+# status:done       -> Done
+#
+# Requires a repo secret named PROJECT_TOKEN: a classic personal access token
+# with the `project` scope (user-owned boards don't accept fine-grained tokens).
+# Sync is one-way: dragging a card on the board does NOT change its label.
+
+name: Board sync
+
+on:
+  issues:
+    types: [labeled]
+
+permissions:
+  issues: write # lets step 2 remove the old status labels with the built-in token
+
+env:
+  PROJECT_OWNER: jTawadros
+  PROJECT_NUMBER: "2"
+
+jobs:
+  sync:
+    # Only react to status labels; ignore every other label.
+    if: startsWith(github.event.label.name, 'status:')
+    runs-on: ubuntu-latest
+    steps:
+      - name: Move the card to the matching column
+        uses: actions/github-script@v8
+        with:
+          # Board changes need your personal token; the built-in token can't reach user boards.
+          github-token: ${{ secrets.PROJECT_TOKEN }}
+          script: |
+            const owner = process.env.PROJECT_OWNER;
+            const number = Number(process.env.PROJECT_NUMBER);
+            const label = context.payload.label.name;
+
+            // "status:in-progress" -> "inprogress"; "In Progress" -> "inprogress"
+            const normalize = (s) => s.toLowerCase().replace(/[^a-z0-9]/g, "");
+            const wanted = normalize(label.slice("status:".length));
+
+            // 1. Look up the board and its Status column options.
+            const { user } = await github.graphql(
+              `query($owner: String!, $number: Int!) {
+                user(login: $owner) {
+                  projectV2(number: $number) {
+                    id
+                    field(name: "Status") {
+                      ... on ProjectV2SingleSelectField { id options { id name } }
+                    }
+                  }
+                }
+              }`,
+              { owner, number }
+            );
+            const project = user?.projectV2;
+            if (!project) {
+              core.setFailed(`Project #${number} not found for ${owner}. Check PROJECT_NUMBER and the token's project scope.`);
+              return;
+            }
+            if (!project.field) {
+              core.setFailed(`Project #${number} has no single-select field named "Status".`);
+              return;
+            }
+
+            const option = project.field.options.find((o) => normalize(o.name) === wanted);
+            if (!option) {
+              const columns = project.field.options.map((o) => o.name).join(", ");
+              core.setFailed(`No board column matches "${label}". Columns are: ${columns}`);
+              return;
+            }
+
+            // 2. Make sure the issue is on the board (returns the existing card if it already is).
+            const added = await github.graphql(
+              `mutation($project: ID!, $content: ID!) {
+                addProjectV2ItemById(input: { projectId: $project, contentId: $content }) { item { id } }
+              }`,
+              { project: project.id, content: context.payload.issue.node_id }
+            );
+            const itemId = added.addProjectV2ItemById.item.id;
+
+            // 3. Move the card.
+            await github.graphql(
+              `mutation($project: ID!, $item: ID!, $field: ID!, $option: String!) {
+                updateProjectV2ItemFieldValue(input: {
+                  projectId: $project, itemId: $item, fieldId: $field,
+                  value: { singleSelectOptionId: $option }
+                }) { projectV2Item { id } }
+              }`,
+              { project: project.id, item: itemId, field: project.field.id, option: option.id }
+            );
+            core.info(`Moved #${context.payload.issue.number} to "${option.name}".`);
+
+      - name: Remove the other status labels
+        uses: actions/github-script@v8
+        with:
+          script: |
+            const current = context.payload.label.name;
+            const stale = context.payload.issue.labels
+              .map((l) => l.name)
+              .filter((name) => name.startsWith("status:") && name !== current);
+            for (const name of stale) {
+              await github.rest.issues.removeLabel({
+                owner: context.repo.owner,
+                repo: context.repo.repo,
+                issue_number: context.payload.issue.number,
+                name,
+              });
+              core.info(`Removed old label ${name}.`);
+            }
